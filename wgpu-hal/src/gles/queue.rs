@@ -741,14 +741,13 @@ impl super::Queue {
                 let (block_width, block_height) = dst_format.block_dimensions();
                 let block_size = dst_format.block_copy_size(None).unwrap();
                 let format_desc = self.shared.describe_texture_format(dst_format);
-                let row_texels = copy
-                    .buffer_layout
-                    .bytes_per_row
-                    .map_or(0, |bpr| block_width * bpr / block_size);
-                let column_texels = copy
-                    .buffer_layout
-                    .rows_per_image
-                    .map_or(0, |rpi| block_height * rpi);
+                let (row_texels, column_texels) = unpack_lengths(
+                    dst_format.is_compressed(),
+                    (block_width, block_height),
+                    block_size,
+                    &copy.buffer_layout,
+                    &copy.size,
+                );
 
                 unsafe { gl.bind_texture(dst_target, Some(dst)) };
                 unsafe { gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, row_texels as i32) };
@@ -1940,3 +1939,99 @@ impl crate::Queue for super::Queue {
 unsafe impl Sync for super::Queue {}
 #[cfg(send_sync)]
 unsafe impl Send for super::Queue {}
+
+/// `UNPACK_ROW_LENGTH` and `UNPACK_IMAGE_HEIGHT`, in texels, for a buffer-to-texture copy.
+///
+/// For compressed formats GL honours these only together with the `UNPACK_COMPRESSED_BLOCK_*`
+/// parameters, which are not set here, so a conforming driver ignores them. Some drivers apply
+/// them anyway: on an Intel HD 4600 (Windows driver 20.19.15.4531) BC7 textures uploaded with a
+/// row length came out as block noise. A tightly packed compressed copy - the common case - so
+/// leaves both at 0, the default every driver reads as tightly packed.
+fn unpack_lengths(
+    compressed: bool,
+    (block_width, block_height): (u32, u32),
+    block_size: u32,
+    layout: &wgt::TexelCopyBufferLayout,
+    size: &crate::CopyExtent,
+) -> (u32, u32) {
+    if compressed {
+        let tight_row = size.width.div_ceil(block_width) * block_size;
+        let block_rows = size.height.div_ceil(block_height);
+        let tight_rows = layout.bytes_per_row.is_none_or(|bpr| bpr == tight_row);
+        // Image height only matters between the images of a 3D or array copy.
+        let tight_images =
+            size.depth <= 1 || layout.rows_per_image.is_none_or(|rpi| rpi == block_rows);
+        if tight_rows && tight_images {
+            return (0, 0);
+        }
+    }
+    let row_texels = layout
+        .bytes_per_row
+        .map_or(0, |bpr| block_width * bpr / block_size);
+    let column_texels = layout.rows_per_image.map_or(0, |rpi| block_height * rpi);
+    (row_texels, column_texels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unpack_lengths;
+
+    fn layout(
+        bytes_per_row: Option<u32>,
+        rows_per_image: Option<u32>,
+    ) -> wgt::TexelCopyBufferLayout {
+        wgt::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row,
+            rows_per_image,
+        }
+    }
+
+    fn size(width: u32, height: u32, depth: u32) -> crate::CopyExtent {
+        crate::CopyExtent {
+            width,
+            height,
+            depth,
+        }
+    }
+
+    #[test]
+    fn tightly_packed_compressed_uploads_leave_the_unpack_lengths_at_zero() {
+        // A 2048x2048 BC7 level: rows of 512 blocks, rows_per_image given in texels.
+        let level = layout(Some(512 * 16), Some(2048));
+        assert_eq!(
+            unpack_lengths(true, (4, 4), 16, &level, &size(2048, 2048, 1)),
+            (0, 0)
+        );
+        // An 8x8 level, two blocks per row.
+        let small = layout(Some(2 * 16), None);
+        assert_eq!(
+            unpack_lengths(true, (4, 4), 16, &small, &size(8, 8, 1)),
+            (0, 0)
+        );
+        assert_eq!(
+            unpack_lengths(true, (4, 4), 16, &layout(None, None), &size(64, 64, 1)),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn padded_compressed_rows_keep_their_row_length() {
+        // An 8x8 BC7 level with its 32-byte rows padded to 256 bytes.
+        let padded = layout(Some(256), Some(2));
+        assert_eq!(
+            unpack_lengths(true, (4, 4), 16, &padded, &size(8, 8, 1)),
+            (64, 8)
+        );
+    }
+
+    #[test]
+    fn uncompressed_uploads_keep_their_unpack_lengths() {
+        // RGBA8, 70 px wide, rows padded to 512 bytes.
+        let rgba8 = layout(Some(512), Some(40));
+        assert_eq!(
+            unpack_lengths(false, (1, 1), 4, &rgba8, &size(70, 40, 1)),
+            (128, 40)
+        );
+    }
+}
