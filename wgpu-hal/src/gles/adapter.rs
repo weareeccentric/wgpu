@@ -106,6 +106,21 @@ impl super::Adapter {
         }
     }
 
+    /// RGTC is core since GL 3.0 and BPTC since GL 4.2, and some drivers list them only
+    /// under their ARB names or not at all (e.g. Intel HD 4600 on Windows lists
+    /// `GL_ARB_texture_compression_rgtc` but not `GL_EXT_texture_compression_rgtc`).
+    /// S3TC is never core in desktop GL.
+    fn desktop_gl_has_bc(has_extension: impl Fn(&str) -> bool, version: (u8, u8)) -> bool {
+        let s3tc = has_extension("GL_EXT_texture_compression_s3tc");
+        let rgtc = version >= (3, 0)
+            || has_extension("GL_ARB_texture_compression_rgtc")
+            || has_extension("GL_EXT_texture_compression_rgtc");
+        let bptc = version >= (4, 2)
+            || has_extension("GL_ARB_texture_compression_bptc")
+            || has_extension("GL_EXT_texture_compression_bptc");
+        s3tc && rgtc && bptc
+    }
+
     fn make_info(vendor_orig: String, renderer_orig: String, version: String) -> wgt::AdapterInfo {
         let vendor = vendor_orig.to_lowercase();
         let renderer = renderer_orig.to_lowercase();
@@ -490,11 +505,6 @@ impl super::Adapter {
             features.set(wgt::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS, true);
             features.set(wgt::Features::TIMESTAMP_QUERY_INSIDE_PASSES, true);
         }
-        let gl_bcn_exts = [
-            "GL_EXT_texture_compression_s3tc",
-            "GL_EXT_texture_compression_rgtc",
-            "GL_ARB_texture_compression_bptc",
-        ];
         let gles_bcn_exts = [
             "GL_EXT_texture_compression_s3tc_srgb",
             "GL_EXT_texture_compression_rgtc",
@@ -506,20 +516,19 @@ impl super::Adapter {
             "EXT_texture_compression_rgtc",
             "EXT_texture_compression_bptc",
         ];
-        let bcn_exts = if cfg!(any(webgl, Emscripten)) {
-            &webgl_bcn_exts[..]
+        let has_bc = if cfg!(any(webgl, Emscripten)) {
+            webgl_bcn_exts.iter().all(|&ext| extensions.contains(ext))
         } else if es_ver.is_some() {
-            &gles_bcn_exts[..]
+            gles_bcn_exts.iter().all(|&ext| extensions.contains(ext))
         } else {
-            &gl_bcn_exts[..]
+            full_ver.is_some_and(|full_ver| {
+                Self::desktop_gl_has_bc(|ext| extensions.contains(ext), full_ver)
+            })
         };
-        features.set(
-            wgt::Features::TEXTURE_COMPRESSION_BC,
-            bcn_exts.iter().all(|&ext| extensions.contains(ext)),
-        );
+        features.set(wgt::Features::TEXTURE_COMPRESSION_BC, has_bc);
         features.set(
             wgt::Features::TEXTURE_COMPRESSION_BC_SLICED_3D,
-            bcn_exts.iter().all(|&ext| extensions.contains(ext)), // BC guaranteed Sliced 3D
+            has_bc, // BC guaranteed Sliced 3D
         );
         let has_etc = if cfg!(any(webgl, Emscripten)) {
             extensions.contains("WEBGL_compressed_texture_etc")
@@ -1328,5 +1337,75 @@ mod tests {
             Adapter::parse_version("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)").unwrap(),
             (3, 0)
         );
+    }
+
+    fn desktop_gl_has_bc(version: (u8, u8), extensions: &[&str]) -> bool {
+        Adapter::desktop_gl_has_bc(|ext| extensions.contains(&ext), version)
+    }
+
+    #[test]
+    fn desktop_gl_bc_rgtc_and_bptc_under_arb_names() {
+        // Intel HD 4600, Windows driver 20.19.15.4531
+        assert!(desktop_gl_has_bc(
+            (4, 3),
+            &[
+                "GL_EXT_texture_compression_s3tc",
+                "GL_ARB_texture_compression_rgtc",
+                "GL_ARB_texture_compression_bptc",
+            ],
+        ));
+    }
+
+    #[test]
+    fn desktop_gl_bc_all_exact_names() {
+        assert!(desktop_gl_has_bc(
+            (4, 6),
+            &[
+                "GL_EXT_texture_compression_s3tc",
+                "GL_EXT_texture_compression_rgtc",
+                "GL_ARB_texture_compression_bptc",
+            ],
+        ));
+    }
+
+    #[test]
+    fn desktop_gl_bc_requires_s3tc() {
+        assert!(!desktop_gl_has_bc(
+            (4, 6),
+            &[
+                "GL_EXT_texture_compression_rgtc",
+                "GL_ARB_texture_compression_bptc",
+            ],
+        ));
+    }
+
+    #[test]
+    fn desktop_gl_bc_requires_bptc_before_4_2() {
+        assert!(!desktop_gl_has_bc(
+            (3, 3),
+            &[
+                "GL_EXT_texture_compression_s3tc",
+                "GL_EXT_texture_compression_rgtc",
+            ],
+        ));
+    }
+
+    #[test]
+    fn desktop_gl_bc_rgtc_and_bptc_core_in_4_2() {
+        assert!(desktop_gl_has_bc(
+            (4, 2),
+            &["GL_EXT_texture_compression_s3tc"]
+        ));
+    }
+
+    #[test]
+    fn desktop_gl_bc_rgtc_core_in_3_0() {
+        assert!(desktop_gl_has_bc(
+            (3, 3),
+            &[
+                "GL_EXT_texture_compression_s3tc",
+                "GL_ARB_texture_compression_bptc",
+            ],
+        ));
     }
 }
